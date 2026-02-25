@@ -26,7 +26,7 @@ interface ActiveSession {
 }
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
-const SFTP_SSH_PORT = parseInt(process.env.SFTP_PORT || "2222", 10);
+const SFTP_SSH_PORT = parseInt(process.env.SFTP_PORT || "22", 10);
 const SFTP_USER_PREFIX = "alsftp_";
 
 const activeSessions = new Map<string, ActiveSession>();
@@ -184,7 +184,8 @@ async function teardownChrootStructure(username: string): Promise<void> {
 
 async function createSystemUser(username: string, password: string, chrootBase: string): Promise<void> {
   // Create user with no login shell, no home dir creation initially
-  execSafe(`useradd -M -s /usr/sbin/nologin -g airlinksftp -d /files ${username}`);
+  // Home dir must be the chroot base so sshd's ChrootDirectory %h resolves correctly
+  execSafe(`useradd -M -s /usr/sbin/nologin -g airlinksftp -d ${chrootBase} ${username}`);
 
   // Set password
   execSafe(`echo '${username}:${password.replace(/'/g, "'\\''")}' | chpasswd`);
