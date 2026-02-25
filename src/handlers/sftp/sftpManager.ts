@@ -159,8 +159,7 @@ async function setupChrootStructure(
     execSafe(`mount --bind ${volumePath} ${filesDir}`);
   }
 
-  // The files directory should be owned by the sftp user
-  execSafe(`chown ${username}:airlinksftp ${filesDir}`);
+  // filesDir permissions set after user is created (user must exist for chown)
   execSafe(`chmod 750 ${filesDir}`);
 
   return chrootBase;
@@ -230,6 +229,8 @@ export async function generateCredential(containerId: string): Promise<SftpCrede
 
   const chrootBase = await setupChrootStructure(username, volumePath);
   await createSystemUser(username, password, chrootBase);
+  // Now that the user exists, set ownership of the files directory
+  execSafe(`chown ${username}:airlinksftp ${chrootBase}/files`);
 
   const timer = scheduleExpiry(existingKey, SESSION_TTL_MS);
 
