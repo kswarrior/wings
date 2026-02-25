@@ -87,8 +87,8 @@ Match Group airlinksftp
   let config = "";
   try {
     config = fs.readFileSync(configPath, "utf-8");
-  } catch {
-    logger.error("Cannot read sshd_config");
+  } catch (err) {
+    logger.error("Cannot read sshd_config", err);
     throw new Error("Cannot read /etc/ssh/sshd_config");
   }
 
