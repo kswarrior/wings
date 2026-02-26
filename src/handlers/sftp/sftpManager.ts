@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import path from "path";
 import fs from "fs";
+import net from "net";
 import logger from "../../utils/logger";
 import { docker } from "../instances/utils";
 
@@ -16,6 +17,7 @@ interface ActiveSession {
   containerId: string;
   username: string;
   sftpContainerName: string;
+  port: number;
   expiresAt: number;
   timer: NodeJS.Timeout;
 }
@@ -23,7 +25,13 @@ interface ActiveSession {
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 const SFTP_IMAGE = "atmoz/sftp";
 const SFTP_USER_PREFIX = "alsftp_";
-const SFTP_PORT = parseInt(process.env.SFTP_PORT || "3003", 10);
+const PORT_RANGE_START = 3003;
+const PORT_RANGE_END = 4000;
+
+// Ports to never use — daemon, common services, etc.
+const BLOCKED_PORTS = new Set([
+  3000, 3001, 3002, 3003, 3306, 3389, 4000, 5432, 5900, 6379, 8080, 8443, 8888,
+]);
 
 const activeSessions = new Map<string, ActiveSession>();
 
@@ -42,6 +50,36 @@ function generateUsername(containerId: string): string {
 
 function generatePassword(): string {
   return crypto.randomBytes(24).toString("base64url");
+}
+
+function getUsedPorts(): Set<number> {
+  const used = new Set<number>();
+  for (const session of activeSessions.values()) {
+    used.add(session.port);
+  }
+  return used;
+}
+
+function isPortFree(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", () => resolve(false));
+    server.once("listening", () => {
+      server.close();
+      resolve(true);
+    });
+    server.listen(port, "0.0.0.0");
+  });
+}
+
+async function allocatePort(): Promise<number> {
+  const used = getUsedPorts();
+  for (let port = PORT_RANGE_START; port <= PORT_RANGE_END; port++) {
+    if (BLOCKED_PORTS.has(port)) continue;
+    if (used.has(port)) continue;
+    if (await isPortFree(port)) return port;
+  }
+  throw new Error("No free SFTP ports available in range.");
 }
 
 async function pullSftpImage(): Promise<void> {
@@ -65,18 +103,15 @@ async function startSftpContainer(
   containerName: string,
   username: string,
   password: string,
-  volumePath: string
+  volumePath: string,
+  port: number
 ): Promise<void> {
-  // Remove any existing container with this name — handles daemon restarts
-  // where the session map is empty but the container is still running.
   try {
     await docker.getContainer(containerName).remove({ force: true });
   } catch {
     // didn't exist, fine
   }
 
-  // atmoz/sftp creates the sftp user with UID 1000 inside the container.
-  // The volume on the host must be owned by that UID so uploads are permitted.
   fs.chownSync(volumePath, 1000, 1000);
 
   const container = await docker.createContainer({
@@ -86,7 +121,7 @@ async function startSftpContainer(
     HostConfig: {
       Binds: [`${volumePath}:/home/${username}/upload`],
       PortBindings: {
-        "22/tcp": [{ HostPort: String(SFTP_PORT) }],
+        "22/tcp": [{ HostPort: String(port) }],
       },
       AutoRemove: true,
     },
@@ -128,12 +163,13 @@ export async function generateCredential(containerId: string): Promise<SftpCrede
 
   await pullSftpImage();
 
+  const port = await allocatePort();
   const username = generateUsername(containerId);
   const password = generatePassword();
   const sftpContainerName = `alsftp_${containerId}`;
   const expiresAt = Date.now() + SESSION_TTL_MS;
 
-  await startSftpContainer(sftpContainerName, username, password, volumePath);
+  await startSftpContainer(sftpContainerName, username, password, volumePath, port);
 
   const timer = scheduleExpiry(existingKey, SESSION_TTL_MS);
 
@@ -141,19 +177,20 @@ export async function generateCredential(containerId: string): Promise<SftpCrede
     containerId,
     username,
     sftpContainerName,
+    port,
     expiresAt,
     timer,
   });
 
   const host = process.env.remote || "127.0.0.1";
 
-  logger.info(`SFTP session started for container ${containerId}: user=${username} port=${SFTP_PORT}`);
+  logger.info(`SFTP session started for container ${containerId}: user=${username} port=${port}`);
 
   return {
     username,
     password,
     host,
-    port: SFTP_PORT,
+    port,
     expiresAt,
   };
 }
