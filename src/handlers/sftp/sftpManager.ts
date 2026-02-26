@@ -1,8 +1,8 @@
-import { execSync } from "child_process";
 import crypto from "crypto";
-import fs from "fs";
 import path from "path";
+import fs from "fs";
 import logger from "../../utils/logger";
+import { docker } from "../instances/utils";
 
 export interface SftpCredential {
   username: string;
@@ -16,18 +16,17 @@ export interface SftpCredential {
 interface ActiveSession {
   containerId: string;
   username: string;
-  password: string;
+  sftpContainerName: string;
+  hostPort: number;
   expiresAt: number;
   timer: NodeJS.Timeout;
 }
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
-const SFTP_SSH_PORT = parseInt(process.env.SFTP_PORT || "22", 10);
+const SFTP_IMAGE = "atmoz/sftp";
 const SFTP_USER_PREFIX = "alsftp_";
-const VOLUMES_DIR = path.resolve("volumes");
-const SSHD_CONFIG = "/etc/ssh/sshd_config";
-const AIRLINK_MARKER = "# AirLink-SFTP-BEGIN";
-const AIRLINK_END = "# AirLink-SFTP-END";
+const PORT_RANGE_START = 2200;
+const PORT_RANGE_END = 2299;
 
 const activeSessions = new Map<string, ActiveSession>();
 
@@ -48,116 +47,73 @@ function generatePassword(): string {
   return crypto.randomBytes(24).toString("base64url");
 }
 
-function execSafe(cmd: string): void {
-  try {
-    execSync(cmd, { stdio: "pipe" });
-  } catch (err: any) {
-    throw new Error(`Command failed: ${cmd}\n${err.stderr?.toString() || err.message}`);
+function getUsedPorts(): Set<number> {
+  const used = new Set<number>();
+  for (const session of activeSessions.values()) {
+    used.add(session.hostPort);
   }
+  return used;
 }
 
-function reloadSshd(): void {
+function allocatePort(): number {
+  const used = getUsedPorts();
+  for (let p = PORT_RANGE_START; p <= PORT_RANGE_END; p++) {
+    if (!used.has(p)) return p;
+  }
+  throw new Error("No available SFTP ports in range");
+}
+
+async function pullSftpImage(): Promise<void> {
   try {
-    execSync("systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null || true", { stdio: "pipe" });
+    await docker.getImage(SFTP_IMAGE).inspect();
   } catch {
-    // best effort
+    logger.info(`Pulling ${SFTP_IMAGE} image...`);
+    await new Promise<void>((resolve, reject) => {
+      docker.pull(SFTP_IMAGE, (err: any, stream: any) => {
+        if (err) return reject(err);
+        docker.modem.followProgress(stream, (err: any) => {
+          if (err) return reject(err);
+          resolve();
+        });
+      });
+    });
   }
 }
 
-function readSshdConfig(): string {
+async function startSftpContainer(
+  containerName: string,
+  username: string,
+  password: string,
+  volumePath: string,
+  hostPort: number
+): Promise<void> {
+  // atmoz/sftp expects: username:password:::directory
+  // The directory after ::: is created inside /home/username and becomes the upload dir
+  const userSpec = `${username}:${password}:::upload`;
+
+  const container = await docker.createContainer({
+    name: containerName,
+    Image: SFTP_IMAGE,
+    Cmd: [userSpec],
+    HostConfig: {
+      Binds: [`${volumePath}:/home/${username}/upload`],
+      PortBindings: {
+        "22/tcp": [{ HostPort: String(hostPort) }],
+      },
+      AutoRemove: true,
+    },
+  });
+
+  await container.start();
+}
+
+async function stopSftpContainer(containerName: string): Promise<void> {
   try {
-    return fs.readFileSync(SSHD_CONFIG, "utf-8");
-  } catch (err) {
-    logger.error("Cannot read sshd_config", err);
-    throw new Error("Cannot read /etc/ssh/sshd_config");
-  }
-}
-
-function writeSshdConfig(content: string): void {
-  fs.writeFileSync(SSHD_CONFIG, content, "utf-8");
-  reloadSshd();
-}
-
-// Extracts the managed block between our markers, returns the user match blocks inside it
-function parseManagedBlock(config: string): { before: string; block: string; after: string } {
-  const start = config.indexOf(AIRLINK_MARKER);
-  const end = config.indexOf(AIRLINK_END);
-
-  if (start === -1 || end === -1) {
-    return { before: config, block: "", after: "" };
-  }
-
-  return {
-    before: config.substring(0, start),
-    block: config.substring(start + AIRLINK_MARKER.length, end),
-    after: config.substring(end + AIRLINK_END.length),
-  };
-}
-
-function buildUserMatchBlock(username: string, chrootDir: string): string {
-  return `
-Match User ${username}
-    ChrootDirectory ${chrootDir}
-    ForceCommand internal-sftp
-    AllowTcpForwarding no
-    X11Forwarding no
-    PermitTunnel no
-    AllowAgentForwarding no
-`;
-}
-
-function addUserToSshdConfig(username: string, chrootDir: string): void {
-  let config = readSshdConfig();
-
-  // Ensure sftp subsystem is set to internal-sftp
-  if (!config.includes("Subsystem sftp internal-sftp")) {
-    config = config.replace(/^Subsystem\s+sftp\s+.+$/m, "");
-    config += "\nSubsystem sftp internal-sftp\n";
-  }
-
-  const { before, block, after } = parseManagedBlock(config);
-  const newBlock = block + buildUserMatchBlock(username, chrootDir);
-  const newConfig = `${before}${AIRLINK_MARKER}${newBlock}${AIRLINK_END}${after}`;
-
-  writeSshdConfig(newConfig);
-}
-
-function removeUserFromSshdConfig(username: string): void {
-  const config = readSshdConfig();
-  const { before, block, after } = parseManagedBlock(config);
-
-  if (!block) return;
-
-  // Remove the Match User block for this specific user
-  const userBlockRegex = new RegExp(
-    `\nMatch User ${username}\n(?:    [^\n]+\n)*`,
-    "g"
-  );
-  const newBlock = block.replace(userBlockRegex, "");
-  const newConfig = `${before}${AIRLINK_MARKER}${newBlock}${AIRLINK_END}${after}`;
-
-  writeSshdConfig(newConfig);
-}
-
-async function createSystemUser(username: string, password: string, chrootDir: string): Promise<void> {
-  // chroot dir must be root:root 755 — sshd requirement
-  execSafe(`chown root:root ${chrootDir}`);
-  execSafe(`chmod 755 ${chrootDir}`);
-
-  // User home is / inside their chroot (which is the volume root)
-  execSafe(`useradd -M -s /usr/sbin/nologin -d / ${username}`);
-  execSafe(`echo '${username}:${password.replace(/'/g, "'\\''")}' | chpasswd`);
-
-  addUserToSshdConfig(username, chrootDir);
-}
-
-async function removeSystemUser(username: string): Promise<void> {
-  try {
-    execSync(`userdel -f ${username} 2>/dev/null || true`, { stdio: "pipe" });
+    const container = docker.getContainer(containerName);
+    await container.stop({ t: 3 });
   } catch {
-    // ignore
+    // already stopped or removed
   }
-  removeUserFromSshdConfig(username);
 }
 
 function scheduleExpiry(sessionKey: string, ttl: number): NodeJS.Timeout {
@@ -171,9 +127,9 @@ export async function generateCredential(containerId: string): Promise<SftpCrede
     throw new Error("Invalid container ID");
   }
 
-  const chrootDir = path.join(VOLUMES_DIR, containerId);
+  const volumePath = path.resolve("volumes", containerId);
 
-  if (!fs.existsSync(chrootDir)) {
+  if (!fs.existsSync(volumePath)) {
     throw new Error(`Volume for container ${containerId} does not exist`);
   }
 
@@ -182,32 +138,37 @@ export async function generateCredential(containerId: string): Promise<SftpCrede
     await revokeCredential(existingKey);
   }
 
+  await pullSftpImage();
+
   const username = generateUsername(containerId);
   const password = generatePassword();
+  const hostPort = allocatePort();
+  const sftpContainerName = `alsftp_${containerId}`;
   const expiresAt = Date.now() + SESSION_TTL_MS;
 
-  await createSystemUser(username, password, chrootDir);
+  await startSftpContainer(sftpContainerName, username, password, volumePath, hostPort);
 
   const timer = scheduleExpiry(existingKey, SESSION_TTL_MS);
 
   activeSessions.set(existingKey, {
     containerId,
     username,
-    password,
+    sftpContainerName,
+    hostPort,
     expiresAt,
     timer,
   });
 
   const host = process.env.remote || "127.0.0.1";
 
-  logger.info(`SFTP credential created for container ${containerId}: user=${username}`);
+  logger.info(`SFTP session started for container ${containerId}: user=${username} port=${hostPort}`);
 
   return {
     username,
     password,
     host,
-    port: SFTP_SSH_PORT,
-    directory: "/",
+    port: hostPort,
+    directory: "/upload",
     expiresAt,
   };
 }
@@ -219,9 +180,9 @@ export async function revokeCredential(sessionKey: string): Promise<void> {
   clearTimeout(session.timer);
   activeSessions.delete(sessionKey);
 
-  await removeSystemUser(session.username);
+  await stopSftpContainer(session.sftpContainerName);
 
-  logger.info(`SFTP credential revoked for container ${session.containerId}: user=${session.username}`);
+  logger.info(`SFTP session ended for container ${session.containerId}: user=${session.username}`);
 }
 
 export async function revokeCredentialForContainer(containerId: string): Promise<void> {
