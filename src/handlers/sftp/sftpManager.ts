@@ -67,13 +67,12 @@ async function startSftpContainer(
   password: string,
   volumePath: string
 ): Promise<void> {
-  // Stop any existing container with this name first
+  // Remove any existing container with this name — handles daemon restarts
+  // where the session map is empty but the container is still running.
   try {
-    const existing = docker.getContainer(containerName);
-    await existing.stop({ t: 1 });
-    await existing.remove();
+    await docker.getContainer(containerName).remove({ force: true });
   } catch {
-    // didn't exist
+    // didn't exist, fine
   }
 
   // atmoz/sftp creates the sftp user with UID 1000 inside the container.
