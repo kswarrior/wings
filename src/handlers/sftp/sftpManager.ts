@@ -9,7 +9,6 @@ export interface SftpCredential {
   password: string;
   host: string;
   port: number;
-  directory: string;
   expiresAt: number;
 }
 
@@ -17,7 +16,6 @@ interface ActiveSession {
   containerId: string;
   username: string;
   sftpContainerName: string;
-  hostPort: number;
   expiresAt: number;
   timer: NodeJS.Timeout;
 }
@@ -25,8 +23,7 @@ interface ActiveSession {
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 const SFTP_IMAGE = "atmoz/sftp";
 const SFTP_USER_PREFIX = "alsftp_";
-const PORT_RANGE_START = 2200;
-const PORT_RANGE_END = 2299;
+const SFTP_PORT = parseInt(process.env.SFTP_PORT || "3003", 10);
 
 const activeSessions = new Map<string, ActiveSession>();
 
@@ -45,22 +42,6 @@ function generateUsername(containerId: string): string {
 
 function generatePassword(): string {
   return crypto.randomBytes(24).toString("base64url");
-}
-
-function getUsedPorts(): Set<number> {
-  const used = new Set<number>();
-  for (const session of activeSessions.values()) {
-    used.add(session.hostPort);
-  }
-  return used;
-}
-
-function allocatePort(): number {
-  const used = getUsedPorts();
-  for (let p = PORT_RANGE_START; p <= PORT_RANGE_END; p++) {
-    if (!used.has(p)) return p;
-  }
-  throw new Error("No available SFTP ports in range");
 }
 
 async function pullSftpImage(): Promise<void> {
@@ -84,21 +65,25 @@ async function startSftpContainer(
   containerName: string,
   username: string,
   password: string,
-  volumePath: string,
-  hostPort: number
+  volumePath: string
 ): Promise<void> {
-  // atmoz/sftp expects: username:password:::directory
-  // The directory after ::: is created inside /home/username and becomes the upload dir
-  const userSpec = `${username}:${password}:::upload`;
+  // Stop any existing container with this name first
+  try {
+    const existing = docker.getContainer(containerName);
+    await existing.stop({ t: 1 });
+    await existing.remove();
+  } catch {
+    // didn't exist
+  }
 
   const container = await docker.createContainer({
     name: containerName,
     Image: SFTP_IMAGE,
-    Cmd: [userSpec],
+    Cmd: [`${username}:${password}:::upload`],
     HostConfig: {
       Binds: [`${volumePath}:/home/${username}/upload`],
       PortBindings: {
-        "22/tcp": [{ HostPort: String(hostPort) }],
+        "22/tcp": [{ HostPort: String(SFTP_PORT) }],
       },
       AutoRemove: true,
     },
@@ -112,7 +97,7 @@ async function stopSftpContainer(containerName: string): Promise<void> {
     const container = docker.getContainer(containerName);
     await container.stop({ t: 3 });
   } catch {
-    // already stopped or removed
+    // already gone
   }
 }
 
@@ -142,11 +127,10 @@ export async function generateCredential(containerId: string): Promise<SftpCrede
 
   const username = generateUsername(containerId);
   const password = generatePassword();
-  const hostPort = allocatePort();
   const sftpContainerName = `alsftp_${containerId}`;
   const expiresAt = Date.now() + SESSION_TTL_MS;
 
-  await startSftpContainer(sftpContainerName, username, password, volumePath, hostPort);
+  await startSftpContainer(sftpContainerName, username, password, volumePath);
 
   const timer = scheduleExpiry(existingKey, SESSION_TTL_MS);
 
@@ -154,21 +138,19 @@ export async function generateCredential(containerId: string): Promise<SftpCrede
     containerId,
     username,
     sftpContainerName,
-    hostPort,
     expiresAt,
     timer,
   });
 
   const host = process.env.remote || "127.0.0.1";
 
-  logger.info(`SFTP session started for container ${containerId}: user=${username} port=${hostPort}`);
+  logger.info(`SFTP session started for container ${containerId}: user=${username} port=${SFTP_PORT}`);
 
   return {
     username,
     password,
     host,
-    port: hostPort,
-    directory: "/upload",
+    port: SFTP_PORT,
     expiresAt,
   };
 }
