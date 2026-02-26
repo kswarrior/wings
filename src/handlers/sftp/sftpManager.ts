@@ -1,11 +1,8 @@
-import { execSync, exec } from "child_process";
-import { promisify } from "util";
+import { execSync } from "child_process";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import logger from "../../utils/logger";
-
-const execAsync = promisify(exec);
 
 export interface SftpCredential {
   username: string;
@@ -20,7 +17,6 @@ interface ActiveSession {
   containerId: string;
   username: string;
   password: string;
-  volumePath: string;
   expiresAt: number;
   timer: NodeJS.Timeout;
 }
@@ -28,12 +24,12 @@ interface ActiveSession {
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 const SFTP_SSH_PORT = parseInt(process.env.SFTP_PORT || "22", 10);
 const SFTP_USER_PREFIX = "alsftp_";
+const VOLUMES_DIR = path.resolve("volumes");
+const SSHD_CONFIG = "/etc/ssh/sshd_config";
+const AIRLINK_MARKER = "# AirLink-SFTP-BEGIN";
+const AIRLINK_END = "# AirLink-SFTP-END";
 
 const activeSessions = new Map<string, ActiveSession>();
-
-function getVolumePathForContainer(containerId: string): string {
-  return path.resolve(`volumes/${containerId}`);
-}
 
 function sanitizeContainerId(id: string): boolean {
   return /^[a-zA-Z0-9_-]{1,64}$/.test(id);
@@ -60,135 +56,99 @@ function execSafe(cmd: string): void {
   }
 }
 
-async function sshd_configured(): Promise<boolean> {
+function reloadSshd(): void {
   try {
-    const sshdConfig = fs.readFileSync("/etc/ssh/sshd_config", "utf-8");
-    return sshdConfig.includes("Subsystem sftp internal-sftp") &&
-           sshdConfig.includes("ChrootDirectory");
+    execSync("systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null || true", { stdio: "pipe" });
   } catch {
-    return false;
+    // best effort
   }
 }
 
-async function ensureSshdConfigured(): Promise<void> {
-  const configPath = "/etc/ssh/sshd_config";
-  const matchBlock = `
+function readSshdConfig(): string {
+  try {
+    return fs.readFileSync(SSHD_CONFIG, "utf-8");
+  } catch (err) {
+    logger.error("Cannot read sshd_config", err);
+    throw new Error("Cannot read /etc/ssh/sshd_config");
+  }
+}
 
-# AirLink SFTP managed block - do not edit manually
-Match Group airlinksftp
-    ChrootDirectory %h
+function writeSshdConfig(content: string): void {
+  fs.writeFileSync(SSHD_CONFIG, content, "utf-8");
+  reloadSshd();
+}
+
+// Extracts the managed block between our markers, returns the user match blocks inside it
+function parseManagedBlock(config: string): { before: string; block: string; after: string } {
+  const start = config.indexOf(AIRLINK_MARKER);
+  const end = config.indexOf(AIRLINK_END);
+
+  if (start === -1 || end === -1) {
+    return { before: config, block: "", after: "" };
+  }
+
+  return {
+    before: config.substring(0, start),
+    block: config.substring(start + AIRLINK_MARKER.length, end),
+    after: config.substring(end + AIRLINK_END.length),
+  };
+}
+
+function buildUserMatchBlock(username: string, chrootDir: string): string {
+  return `
+Match User ${username}
+    ChrootDirectory ${chrootDir}
     ForceCommand internal-sftp
     AllowTcpForwarding no
     X11Forwarding no
     PermitTunnel no
     AllowAgentForwarding no
 `;
+}
 
-  let config = "";
-  try {
-    config = fs.readFileSync(configPath, "utf-8");
-  } catch (err) {
-    logger.error("Cannot read sshd_config", err);
-    throw new Error("Cannot read /etc/ssh/sshd_config");
-  }
+function addUserToSshdConfig(username: string, chrootDir: string): void {
+  let config = readSshdConfig();
 
-  let changed = false;
-
+  // Ensure sftp subsystem is set to internal-sftp
   if (!config.includes("Subsystem sftp internal-sftp")) {
     config = config.replace(/^Subsystem\s+sftp\s+.+$/m, "");
     config += "\nSubsystem sftp internal-sftp\n";
-    changed = true;
   }
 
-  if (!config.includes("airlinksftp")) {
-    config += matchBlock;
-    changed = true;
-  }
+  const { before, block, after } = parseManagedBlock(config);
+  const newBlock = block + buildUserMatchBlock(username, chrootDir);
+  const newConfig = `${before}${AIRLINK_MARKER}${newBlock}${AIRLINK_END}${after}`;
 
-  if (changed) {
-    fs.writeFileSync(configPath, config, "utf-8");
-    try {
-      execSync("systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null || true", { stdio: "pipe" });
-    } catch {
-      // best effort reload
-    }
-    logger.info("sshd_config updated for SFTP chroot support");
-  }
-
-  // Ensure the airlinksftp group exists
-  try {
-    execSync("getent group airlinksftp", { stdio: "pipe" });
-  } catch {
-    execSync("groupadd airlinksftp", { stdio: "pipe" });
-    logger.info("Created airlinksftp group");
-  }
+  writeSshdConfig(newConfig);
 }
 
-function buildChrootDir(username: string, volumePath: string): string {
-  // The chroot dir must be owned by root with no write permission for anyone else
-  // We put a subdirectory inside called "files" that is owned by the sftp user
-  return path.resolve(`/tmp/alsftp_chroot/${username}`);
+function removeUserFromSshdConfig(username: string): void {
+  const config = readSshdConfig();
+  const { before, block, after } = parseManagedBlock(config);
+
+  if (!block) return;
+
+  // Remove the Match User block for this specific user
+  const userBlockRegex = new RegExp(
+    `\nMatch User ${username}\n(?:    [^\n]+\n)*`,
+    "g"
+  );
+  const newBlock = block.replace(userBlockRegex, "");
+  const newConfig = `${before}${AIRLINK_MARKER}${newBlock}${AIRLINK_END}${after}`;
+
+  writeSshdConfig(newConfig);
 }
 
-async function setupChrootStructure(
-  username: string,
-  volumePath: string
-): Promise<string> {
-  const chrootBase = `/tmp/alsftp_chroot/${username}`;
-  const filesDir = `${chrootBase}/files`;
+async function createSystemUser(username: string, password: string, chrootDir: string): Promise<void> {
+  // chroot dir must be root:root 755 — sshd requirement
+  execSafe(`chown root:root ${chrootDir}`);
+  execSafe(`chmod 755 ${chrootDir}`);
 
-  fs.mkdirSync(chrootBase, { recursive: true });
-  fs.mkdirSync(filesDir, { recursive: true });
-
-  // chroot root must be owned by root:root, mode 755 - SSH requirement
-  execSafe(`chown root:root ${chrootBase}`);
-  execSafe(`chmod 755 ${chrootBase}`);
-
-  // Bind mount the actual volume directory
-  if (!fs.existsSync(volumePath)) {
-    fs.mkdirSync(volumePath, { recursive: true });
-  }
-
-  // Check if already mounted
-  try {
-    const mounts = fs.readFileSync("/proc/mounts", "utf-8");
-    if (!mounts.includes(filesDir)) {
-      execSafe(`mount --bind ${volumePath} ${filesDir}`);
-    }
-  } catch {
-    execSafe(`mount --bind ${volumePath} ${filesDir}`);
-  }
-
-  // filesDir permissions set after user is created (user must exist for chown)
-  execSafe(`chmod 750 ${filesDir}`);
-
-  return chrootBase;
-}
-
-async function teardownChrootStructure(username: string): Promise<void> {
-  const chrootBase = `/tmp/alsftp_chroot/${username}`;
-  const filesDir = `${chrootBase}/files`;
-
-  try {
-    execSync(`umount ${filesDir} 2>/dev/null || true`, { stdio: "pipe" });
-  } catch {
-    // ignore
-  }
-
-  try {
-    fs.rmSync(chrootBase, { recursive: true, force: true });
-  } catch {
-    // ignore
-  }
-}
-
-async function createSystemUser(username: string, password: string, chrootBase: string): Promise<void> {
-  // Create user with no login shell, no home dir creation initially
-  // Home dir must be the chroot base so sshd's ChrootDirectory %h resolves correctly
-  execSafe(`useradd -M -s /usr/sbin/nologin -g airlinksftp -d ${chrootBase} ${username}`);
-
-  // Set password
+  // User home is / inside their chroot (which is the volume root)
+  execSafe(`useradd -M -s /usr/sbin/nologin -d / ${username}`);
   execSafe(`echo '${username}:${password.replace(/'/g, "'\\''")}' | chpasswd`);
+
+  addUserToSshdConfig(username, chrootDir);
 }
 
 async function removeSystemUser(username: string): Promise<void> {
@@ -197,6 +157,7 @@ async function removeSystemUser(username: string): Promise<void> {
   } catch {
     // ignore
   }
+  removeUserFromSshdConfig(username);
 }
 
 function scheduleExpiry(sessionKey: string, ttl: number): NodeJS.Timeout {
@@ -210,28 +171,22 @@ export async function generateCredential(containerId: string): Promise<SftpCrede
     throw new Error("Invalid container ID");
   }
 
-  const volumePath = getVolumePathForContainer(containerId);
+  const chrootDir = path.join(VOLUMES_DIR, containerId);
 
-  if (!fs.existsSync(volumePath)) {
+  if (!fs.existsSync(chrootDir)) {
     throw new Error(`Volume for container ${containerId} does not exist`);
   }
 
-  // Revoke any existing session for this container
   const existingKey = `container:${containerId}`;
   if (activeSessions.has(existingKey)) {
     await revokeCredential(existingKey);
   }
 
-  await ensureSshdConfigured();
-
   const username = generateUsername(containerId);
   const password = generatePassword();
   const expiresAt = Date.now() + SESSION_TTL_MS;
 
-  const chrootBase = await setupChrootStructure(username, volumePath);
-  await createSystemUser(username, password, chrootBase);
-  // Now that the user exists, set ownership of the files directory
-  execSafe(`chown ${username}:airlinksftp ${chrootBase}/files`);
+  await createSystemUser(username, password, chrootDir);
 
   const timer = scheduleExpiry(existingKey, SESSION_TTL_MS);
 
@@ -239,7 +194,6 @@ export async function generateCredential(containerId: string): Promise<SftpCrede
     containerId,
     username,
     password,
-    volumePath,
     expiresAt,
     timer,
   });
@@ -253,7 +207,7 @@ export async function generateCredential(containerId: string): Promise<SftpCrede
     password,
     host,
     port: SFTP_SSH_PORT,
-    directory: "/files",
+    directory: "/",
     expiresAt,
   };
 }
@@ -266,7 +220,6 @@ export async function revokeCredential(sessionKey: string): Promise<void> {
   activeSessions.delete(sessionKey);
 
   await removeSystemUser(session.username);
-  await teardownChrootStructure(session.username);
 
   logger.info(`SFTP credential revoked for container ${session.containerId}: user=${session.username}`);
 }
@@ -288,5 +241,4 @@ export async function cleanupExpiredSessions(): Promise<void> {
   }
 }
 
-// Periodic cleanup every hour
 setInterval(cleanupExpiredSessions, 60 * 60 * 1000);
