@@ -76,6 +76,10 @@ async function startSftpContainer(
     // didn't exist
   }
 
+  // atmoz/sftp creates the sftp user with UID 1000 inside the container.
+  // The volume on the host must be owned by that UID so uploads are permitted.
+  fs.chownSync(volumePath, 1000, 1000);
+
   const container = await docker.createContainer({
     name: containerName,
     Image: SFTP_IMAGE,
